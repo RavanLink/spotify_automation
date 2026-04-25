@@ -2,7 +2,9 @@ import os
 import re
 import time
 import webbrowser
+import argparse
 from pathlib import Path
+from urllib.parse import urlparse
 
 import speech_recognition as sr
 import spotipy
@@ -19,6 +21,21 @@ SCOPE = " ".join(
 		"playlist-modify-public",
 	]
 )
+
+
+def validate_redirect_uri(redirect_uri: str) -> tuple[bool, str]:
+	parsed = urlparse(redirect_uri)
+	if parsed.scheme not in {"http", "https"}:
+		return False, "Redirect URI must start with http:// or https://"
+
+	host = (parsed.hostname or "").lower()
+	if parsed.scheme == "http" and host not in {"localhost", "127.0.0.1"}:
+		return False, "Only localhost/127.0.0.1 are allowed for http redirect URIs"
+
+	if not parsed.path:
+		return False, "Redirect URI should include a callback path (example: /callback)"
+
+	return True, "ok"
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -55,6 +72,10 @@ def build_spotify_client() -> spotipy.Spotify:
 			"SPOTIFY_REDIRECT_URI cannot be open.spotify.com. Use a callback URL like http://localhost:8888/callback and set the same URI in Spotify Developer Dashboard."
 		)
 
+	is_valid_redirect, redirect_message = validate_redirect_uri(redirect_uri)
+	if not is_valid_redirect:
+		raise RuntimeError(f"Invalid SPOTIFY_REDIRECT_URI: {redirect_message}")
+
 	print(f"Using redirect URI: {redirect_uri}")
 
 	is_local_http = redirect_uri.lower().startswith("http://localhost")
@@ -86,6 +107,71 @@ def build_spotify_client() -> spotipy.Spotify:
 		auth_manager.get_access_token(code, check_cache=False)
 
 	return spotipy.Spotify(auth_manager=auth_manager)
+
+
+def run_doctor() -> int:
+	load_env_file()
+	print("Running preflight checks...")
+
+	client_id = os.getenv("SPOTIFY_CLIENT_ID", "")
+	client_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+	redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "")
+
+	if not client_id:
+		print("FAIL: SPOTIFY_CLIENT_ID is missing")
+		return 1
+	print("OK: SPOTIFY_CLIENT_ID found")
+
+	if not client_secret:
+		print("FAIL: SPOTIFY_CLIENT_SECRET is missing")
+		return 1
+	print("OK: SPOTIFY_CLIENT_SECRET found")
+
+	if not redirect_uri:
+		print("FAIL: SPOTIFY_REDIRECT_URI is missing")
+		return 1
+
+	ok_redirect, msg = validate_redirect_uri(redirect_uri)
+	if not ok_redirect:
+		print(f"FAIL: SPOTIFY_REDIRECT_URI invalid: {msg}")
+		return 1
+	print(f"OK: SPOTIFY_REDIRECT_URI format valid: {redirect_uri}")
+
+	if redirect_uri.lower().startswith("https://localhost"):
+		print("WARN: Some providers reject https://localhost as insecure. If auth fails, use a public HTTPS callback URL and manual paste flow.")
+
+	if redirect_uri.lower().startswith("http://localhost") or redirect_uri.lower().startswith("http://127.0.0.1"):
+		print("INFO: Local callback flow will auto-open browser.")
+	else:
+		print("INFO: Non-local callback flow will ask you to paste redirected URL.")
+
+	try:
+		mic_names = sr.Microphone.list_microphone_names()
+		if mic_names:
+			print(f"OK: Microphone devices detected: {len(mic_names)}")
+		else:
+			print("WARN: No microphone devices detected")
+	except Exception as exc:
+		print(f"WARN: Could not list microphones: {exc}")
+
+	try:
+		auth_manager = SpotifyOAuth(
+			client_id=client_id,
+			client_secret=client_secret,
+			redirect_uri=redirect_uri,
+			scope=SCOPE,
+			open_browser=False,
+			cache_path=".cache",
+		)
+		auth_url = auth_manager.get_authorize_url()
+		print("OK: Spotify authorize URL generated")
+		print(f"INFO: Authorize URL starts with: {auth_url[:60]}...")
+	except Exception as exc:
+		print(f"FAIL: Could not initialize Spotify OAuth: {exc}")
+		return 1
+
+	print("Preflight complete: setup looks ready.")
+	return 0
 
 
 def listen_for_command(recognizer: sr.Recognizer, microphone: sr.Microphone) -> str | None:
@@ -251,7 +337,14 @@ def handle_command(sp: spotipy.Spotify, command: str, argument: str | None) -> b
 	return True
 
 
-def main() -> None:
+def main() -> int:
+	parser = argparse.ArgumentParser(description="Voice-controlled Spotify automation")
+	parser.add_argument("--doctor", action="store_true", help="Run preflight checks and exit")
+	args = parser.parse_args()
+
+	if args.doctor:
+		return run_doctor()
+
 	sp = build_spotify_client()
 	recognizer = sr.Recognizer()
 	recognizer.operation_timeout = 8
@@ -285,6 +378,8 @@ def main() -> None:
 		if not keep_running:
 			break
 
+	return 0
+
 
 if __name__ == "__main__":
-	main()
+	raise SystemExit(main())
