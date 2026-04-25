@@ -3,11 +3,13 @@ import re
 import time
 import webbrowser
 import argparse
+import ctypes
 from pathlib import Path
 from urllib.parse import urlparse
 
 import speech_recognition as sr
 import spotipy
+from spotipy.exceptions import SpotifyException
 from spotipy.oauth2 import SpotifyOAuth
 
 
@@ -23,6 +25,16 @@ SCOPE = " ".join(
 )
 
 
+# Windows virtual key codes for media controls.
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_PLAY_PAUSE = 0xB3
+VK_VOLUME_MUTE = 0xAD
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP = 0xAF
+KEYEVENTF_KEYUP = 0x0002
+
+
 def validate_redirect_uri(redirect_uri: str) -> tuple[bool, str]:
 	parsed = urlparse(redirect_uri)
 	if parsed.scheme not in {"http", "https"}:
@@ -36,6 +48,19 @@ def validate_redirect_uri(redirect_uri: str) -> tuple[bool, str]:
 		return False, "Redirect URI should include a callback path (example: /callback)"
 
 	return True, "ok"
+
+
+def send_media_key(vk_code: int) -> None:
+	if os.name != "nt":
+		raise RuntimeError("Desktop media key mode currently supports Windows only.")
+	ctypes.windll.user32.keybd_event(vk_code, 0, 0, 0)
+	ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_KEYUP, 0)
+
+
+def open_spotify_uri(uri: str) -> None:
+	if os.name != "nt":
+		raise RuntimeError("Spotify URI open is currently supported on Windows only.")
+	os.startfile(uri)
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -72,6 +97,11 @@ def build_spotify_client() -> spotipy.Spotify:
 			"SPOTIFY_REDIRECT_URI cannot be open.spotify.com. Use a callback URL like http://localhost:8888/callback and set the same URI in Spotify Developer Dashboard."
 		)
 
+	if redirect_uri.lower().startswith("https://localhost") or redirect_uri.lower().startswith("https://127.0.0.1"):
+		raise RuntimeError(
+			"SPOTIFY_REDIRECT_URI=https://localhost... is rejected as insecure in your setup. Use a public HTTPS callback URL such as https://oauth.pstmn.io/v1/callback and set the same value in Spotify Developer Dashboard."
+		)
+
 	is_valid_redirect, redirect_message = validate_redirect_uri(redirect_uri)
 	if not is_valid_redirect:
 		raise RuntimeError(f"Invalid SPOTIFY_REDIRECT_URI: {redirect_message}")
@@ -95,15 +125,33 @@ def build_spotify_client() -> spotipy.Spotify:
 		print("Open this URL and approve access:")
 		print(auth_url)
 		print("Important: the redirect URI in this URL must exactly match your Spotify app setting, including http/https, port, path, and trailing slash.")
+		print("After approval, copy the full redirected URL (or just the code value) and paste it below.")
 		try:
 			webbrowser.open(auth_url)
 		except Exception:
 			pass
 
-		redirect_response = input("Paste the full redirected URL here: ").strip()
-		code = auth_manager.parse_response_code(redirect_response)
+		code = None
+		for _ in range(3):
+			try:
+				redirect_response = input("Paste the full redirected URL here: ").strip()
+			except (KeyboardInterrupt, EOFError):
+				raise RuntimeError("Authorization canceled. Run again and paste the redirected URL to continue.") from None
+
+			if not redirect_response:
+				print("Input was empty. Paste the redirected URL from browser address bar (or only the code value).")
+				continue
+
+			code = auth_manager.parse_response_code(redirect_response)
+			if not code and "?" not in redirect_response and "&" not in redirect_response:
+				code = redirect_response
+			if code:
+				break
+
+			print("Could not parse authorization code. Paste full redirected URL or only the code value.")
+
 		if not code:
-			raise RuntimeError("Could not parse authorization code from redirect URL.")
+			raise RuntimeError("Could not parse authorization code after multiple attempts.")
 		auth_manager.get_access_token(code, check_cache=False)
 
 	return spotipy.Spotify(auth_manager=auth_manager)
@@ -283,6 +331,51 @@ def search_playlist_uri(sp: spotipy.Spotify, query: str) -> str | None:
 	return playlists[0]["uri"]
 
 
+def handle_command_desktop(command: str, argument: str | None) -> bool:
+	if command == "exit":
+		return False
+
+	if command in {"play", "pause"}:
+		send_media_key(VK_MEDIA_PLAY_PAUSE)
+		print("Toggled play/pause via desktop media key.")
+	elif command == "next":
+		send_media_key(VK_MEDIA_NEXT_TRACK)
+		print("Skipped to next track via desktop media key.")
+	elif command == "previous":
+		send_media_key(VK_MEDIA_PREV_TRACK)
+		print("Went to previous track via desktop media key.")
+	elif command == "volume_up":
+		send_media_key(VK_VOLUME_UP)
+		print("Volume up via desktop media key.")
+	elif command == "volume_down":
+		send_media_key(VK_VOLUME_DOWN)
+		print("Volume down via desktop media key.")
+	elif command == "play_song" and argument:
+		open_spotify_uri(f"spotify:search:{argument}")
+		print(f"Opened Spotify search for: {argument}")
+	elif command == "play_playlist" and argument:
+		open_spotify_uri(f"spotify:search:{argument}")
+		print(f"Opened Spotify search for playlist: {argument}")
+	elif command == "search" and argument:
+		open_spotify_uri(f"spotify:search:{argument}")
+		print(f"Opened Spotify search for: {argument}")
+	else:
+		print(f"Unknown command: {argument or command}")
+
+	return True
+
+
+def is_premium_required_error(exc: Exception) -> bool:
+	if not isinstance(exc, SpotifyException):
+		return False
+	message = str(exc).lower()
+	if exc.http_status == 403 and "premium" in message:
+		return True
+	if "active premium subscription required" in message:
+		return True
+	return False
+
+
 def handle_command(sp: spotipy.Spotify, command: str, argument: str | None) -> bool:
 	if command == "exit":
 		return False
@@ -340,12 +433,30 @@ def handle_command(sp: spotipy.Spotify, command: str, argument: str | None) -> b
 def main() -> int:
 	parser = argparse.ArgumentParser(description="Voice-controlled Spotify automation")
 	parser.add_argument("--doctor", action="store_true", help="Run preflight checks and exit")
+	parser.add_argument(
+		"--mode",
+		choices=["auto", "api", "desktop"],
+		default="auto",
+		help="Control mode: api requires Spotify Premium playback APIs, desktop uses media keys without Premium",
+	)
 	args = parser.parse_args()
 
 	if args.doctor:
 		return run_doctor()
 
-	sp = build_spotify_client()
+	sp = None
+	use_desktop_mode = args.mode == "desktop"
+
+	if args.mode in {"auto", "api"}:
+		try:
+			sp = build_spotify_client()
+		except RuntimeError as exc:
+			if args.mode == "api":
+				print(f"Startup failed: {exc}")
+				return 1
+			print(f"API mode unavailable: {exc}")
+			print("Falling back to desktop media-key mode (no Premium required).")
+			use_desktop_mode = True
 	recognizer = sr.Recognizer()
 	recognizer.operation_timeout = 8
 
@@ -370,7 +481,20 @@ def main() -> int:
 
 		command, argument = parse_command(text)
 		try:
-			keep_running = handle_command(sp, command, argument)
+			if use_desktop_mode or sp is None:
+				keep_running = handle_command_desktop(command, argument)
+			else:
+				keep_running = handle_command(sp, command, argument)
+		except SpotifyException as exc:
+			if is_premium_required_error(exc):
+				print("Spotify playback controls require Premium for API mode.")
+				print("Switching to desktop media-key mode (works without Premium).")
+				use_desktop_mode = True
+				sp = None
+				keep_running = handle_command_desktop(command, argument)
+			else:
+				print(f"Command failed: {exc}")
+				keep_running = True
 		except Exception as exc:
 			print(f"Command failed: {exc}")
 			keep_running = True
