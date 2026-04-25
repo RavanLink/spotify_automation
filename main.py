@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import webbrowser
 from pathlib import Path
 
 import speech_recognition as sr
@@ -33,7 +34,7 @@ def load_env_file(path: str = ".env") -> None:
 		key, value = line.split("=", 1)
 		key = key.strip()
 		value = value.strip().strip('"').strip("'")
-		if key and key not in os.environ:
+		if key:
 			os.environ[key] = value
 
 
@@ -42,21 +43,48 @@ def build_spotify_client() -> spotipy.Spotify:
 
 	client_id = os.getenv("SPOTIFY_CLIENT_ID")
 	client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-	redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "https://open.spotify.com/")
+	redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
 
 	if not client_id or not client_secret:
 		raise RuntimeError(
 			"Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET environment variables first."
 		)
 
+	if "open.spotify.com" in redirect_uri.lower():
+		raise RuntimeError(
+			"SPOTIFY_REDIRECT_URI cannot be open.spotify.com. Use a callback URL like http://localhost:8888/callback and set the same URI in Spotify Developer Dashboard."
+		)
+
+	print(f"Using redirect URI: {redirect_uri}")
+
+	is_local_http = redirect_uri.lower().startswith("http://localhost")
+	is_local_http = is_local_http or redirect_uri.lower().startswith("http://127.0.0.1")
+
 	auth_manager = SpotifyOAuth(
 		client_id=client_id,
 		client_secret=client_secret,
 		redirect_uri=redirect_uri,
 		scope=SCOPE,
-		open_browser=True,
+		open_browser=is_local_http,
 		cache_path=".cache",
 	)
+
+	if not is_local_http and not auth_manager.validate_token(auth_manager.cache_handler.get_cached_token()):
+		auth_url = auth_manager.get_authorize_url()
+		print("Open this URL and approve access:")
+		print(auth_url)
+		print("Important: the redirect URI in this URL must exactly match your Spotify app setting, including http/https, port, path, and trailing slash.")
+		try:
+			webbrowser.open(auth_url)
+		except Exception:
+			pass
+
+		redirect_response = input("Paste the full redirected URL here: ").strip()
+		code = auth_manager.parse_response_code(redirect_response)
+		if not code:
+			raise RuntimeError("Could not parse authorization code from redirect URL.")
+		auth_manager.get_access_token(code, check_cache=False)
+
 	return spotipy.Spotify(auth_manager=auth_manager)
 
 
