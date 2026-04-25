@@ -42,7 +42,7 @@ def build_spotify_client() -> spotipy.Spotify:
 
 	client_id = os.getenv("SPOTIFY_CLIENT_ID")
 	client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-	redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "https://python_automation.com")
+	redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "https://open.spotify.com/")
 
 	if not client_id or not client_secret:
 		raise RuntimeError(
@@ -64,7 +64,11 @@ def listen_for_command(recognizer: sr.Recognizer, microphone: sr.Microphone) -> 
 	with microphone as source:
 		print("Listening...")
 		recognizer.adjust_for_ambient_noise(source, duration=0.5)
-		audio = recognizer.listen(source, phrase_time_limit=6)
+		try:
+			audio = recognizer.listen(source, timeout=5, phrase_time_limit=6)
+		except sr.WaitTimeoutError:
+			print("No speech detected.")
+			return None
 
 	try:
 		text = recognizer.recognize_google(audio)
@@ -116,6 +120,21 @@ def get_active_device_id(sp: spotipy.Spotify) -> str | None:
 	devices = sp.devices().get("devices", [])
 	if not devices:
 		return None
+
+	preferred_name = os.getenv("SPOTIFY_DEVICE_NAME", "").strip().lower()
+	if preferred_name:
+		for device in devices:
+			name = str(device.get("name", "")).strip().lower()
+			if name == preferred_name:
+				return device["id"]
+
+	# By default, prefer desktop app devices so commands do not jump to web player.
+	computer_devices = [device for device in devices if str(device.get("type", "")).lower() == "computer"]
+	if computer_devices:
+		active_computers = [device for device in computer_devices if device.get("is_active")]
+		if active_computers:
+			return active_computers[0]["id"]
+		return computer_devices[0]["id"]
 
 	active_devices = [device for device in devices if device.get("is_active")]
 	if active_devices:
@@ -207,6 +226,7 @@ def handle_command(sp: spotipy.Spotify, command: str, argument: str | None) -> b
 def main() -> None:
 	sp = build_spotify_client()
 	recognizer = sr.Recognizer()
+	recognizer.operation_timeout = 8
 
 	try:
 		microphone = sr.Microphone()
@@ -217,7 +237,12 @@ def main() -> None:
 	print('Try commands like: play, pause, next, previous, volume up, play song imagine dragons, play playlist chill')
 
 	while True:
-		text = listen_for_command(recognizer, microphone)
+		try:
+			text = listen_for_command(recognizer, microphone)
+		except KeyboardInterrupt:
+			print("\nStopped by user.")
+			break
+
 		if not text:
 			time.sleep(0.5)
 			continue
